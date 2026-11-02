@@ -126,6 +126,7 @@ sudo ufw logging medium
 | 02-keys-configured | 02.11.2026, после создания devops и настройки ключей |
 | 03-ssh-hardened | 02.11.2026, после усиления SSH |
 | 04-nginx-https | 02.11.2026, после настройки Nginx и HTTPS для devops.local |
+| 05-docker-compose | 03.11.2026, после установки Docker и запуска проекта app (Flask + PostgreSQL) |
 
 Имя узла: `devops-vm`, FQDN `devops-vm.devops.local` (строка `127.0.1.1 devops-vm.devops.local devops-vm` в `/etc/hosts`). На хосте в `C:\Windows\System32\drivers\etc\hosts`: `192.168.56.101 devops.local`.
 
@@ -196,3 +197,52 @@ sudo rm /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl reload nginx
 # на хосте: scp devops:/etc/ssl/certs/devops.crt ~/devops.crt && scripts/deploy.sh
 ```
+
+## 9. Контейнеризация
+
+| Параметр | Значение |
+|---|---|
+| Docker Engine | из официального репозитория `download.docker.com` (пакеты `docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin`), версия 29.9.2, Compose v5.7.0 |
+| Группа docker | `devops` (имеет и право sudo; учётным записям без sudo группа не выдаётся) |
+| Проект на сервере | `~/app` (`/home/devops/app`), доставляется с хоста `rsync -avz --delete --exclude=.env app/ devops:app/` |
+| Файл секретов | `~/app/.env`, владелец devops, права 600, создаётся только на сервере из `.env.example`, пароль `openssl rand -hex 16`; в репозитории — только `.env.example`, `.env` в `.gitignore` и `.dockerignore` |
+| Сервисы | `db` — `postgres:16-alpine`, healthcheck `pg_isready`; `app` — образ `devops-app:1.0` (python:3.12-slim, пользователь app), `depends_on: condition: service_healthy`; оба `restart: unless-stopped` |
+| Публикация портов | `127.0.0.1:5000:5000` (только loopback); порт 5432 не публикуется, СУБД доступна только в сети `app_backend` по имени `db` |
+| Именованный том | `app_db_data` → `/var/lib/postgresql/data` (сохраняется при `docker compose down`, удаляется при `down -v`) |
+| Обратный прокси | в блоке 443 `/etc/nginx/sites-available/devops-site` добавлено `location /app/` → `proxy_pass http://127.0.0.1:5000/` с заголовками Host, X-Real-IP, X-Forwarded-For, X-Forwarded-Proto |
+
+Установка Docker Engine:
+
+```bash
+sudo apt-get install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker devops     # затем новая SSH-сессия
+```
+
+Запуск проекта:
+
+```bash
+cd ~/app && cp .env.example .env && chmod 600 .env
+sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$(openssl rand -hex 16)/" .env
+docker compose up -d --build
+```
+
+Фрагмент Nginx:
+
+```nginx
+    location /app/ {
+        proxy_pass http://127.0.0.1:5000/;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+```
+
+Особенность стенда: на хосте активен Hyper-V, VirtualBox работает через NEM. Ядро периодически зависало в initramfs на этапе «Loading essential drivers» (бенчмарк raid6). Добавлено в `/etc/default/grub`:
+`GRUB_CMDLINE_LINUX_DEFAULT="... modprobe.blacklist=raid6_pq,raid456,async_raid6_recov,btrfs"` и выполнен `sudo update-grub` (на LVM+ext4 эти модули не нужны).
