@@ -125,5 +125,74 @@ sudo ufw logging medium
 | 01-clean-install | 02.11.2026, после установки ОС и `apt upgrade` |
 | 02-keys-configured | 02.11.2026, после создания devops и настройки ключей |
 | 03-ssh-hardened | 02.11.2026, после усиления SSH |
+| 04-nginx-https | 02.11.2026, после настройки Nginx и HTTPS для devops.local |
 
 Имя узла: `devops-vm`, FQDN `devops-vm.devops.local` (строка `127.0.1.1 devops-vm.devops.local devops-vm` в `/etc/hosts`). На хосте в `C:\Windows\System32\drivers\etc\hosts`: `192.168.56.101 devops.local`.
+
+## 8. Веб-сервер
+
+| Параметр | Значение |
+|---|---|
+| Пакет | `nginx` из репозитория Ubuntu (`sudo apt install -y nginx`), версия 1.24.0; master — root, worker — www-data |
+| Конфигурация ресурса | `/etc/nginx/sites-available/devops-site`, ссылка в `/etc/nginx/sites-enabled/`; ссылка `sites-enabled/default` удалена (файл в `sites-available` сохранён) |
+| Каталог ресурса | `/var/www/devops-site`, владелец `devops:devops`, каталог 755, файлы 644 (`index.html`, `404.html`) |
+| Сертификат | `/etc/ssl/certs/devops.crt`, root:root, 644 |
+| Закрытый ключ | `/etc/ssl/private/devops.key`, root:root, 600 |
+| Срок действия сертификата | 365 дней (выпущен 02.11.2026, истекает 02.11.2027) |
+| Журналы | `/var/log/nginx/devops-site.access.log`, `/var/log/nginx/devops-site.error.log` |
+| Доставка содержимого | `scripts/deploy.sh` (rsync `--delete --chmod=D755,F644` из каталога `site/` репозитория) |
+
+Формирование сертификата:
+
+```bash
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/devops.key \
+  -out /etc/ssl/certs/devops.crt \
+  -subj "/CN=devops.local" \
+  -addext "subjectAltName=DNS:devops.local"
+```
+
+Конфигурация `/etc/nginx/sites-available/devops-site`:
+
+```nginx
+server {
+    listen 80;
+    listen [::]:80;
+    server_name devops.local;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name devops.local;
+
+    ssl_certificate     /etc/ssl/certs/devops.crt;
+    ssl_certificate_key /etc/ssl/private/devops.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    root /var/www/devops-site;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    error_page 404 /404.html;
+
+    access_log /var/log/nginx/devops-site.access.log;
+    error_log /var/log/nginx/devops-site.error.log;
+}
+```
+
+Восстановление:
+
+```bash
+sudo apt update && sudo apt install -y nginx rsync
+sudo mkdir -p /var/www/devops-site && sudo chown -R devops:devops /var/www/devops-site
+# создать сертификат (команда выше) и файл конфигурации (выше)
+sudo ln -s /etc/nginx/sites-available/devops-site /etc/nginx/sites-enabled/
+sudo rm /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+# на хосте: scp devops:/etc/ssl/certs/devops.crt ~/devops.crt && scripts/deploy.sh
+```
